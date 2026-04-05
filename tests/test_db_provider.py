@@ -228,22 +228,16 @@ class TestDBDataLoaderStandalone(unittest.TestCase):
             self.assertIn(col, df.columns)
 
     def test_index_daily(self):
-        """Test index daily data (requires stock_index_daily table in ClickHouse)."""
-        try:
-            idx = self.loader.get_index_daily("000300.SH", start_date="2024-01-02", end_date="2024-01-10")
-            self.assertIsInstance(idx, pd.DataFrame)
-            self.assertGreater(len(idx), 0)
-        except Exception as e:
-            self.skipTest(f"stock_index_daily table not available: {e}")
+        """Test index daily data."""
+        idx = self.loader.get_index_daily("000300.SH", start_date="2024-01-02", end_date="2024-01-10")
+        self.assertIsInstance(idx, pd.DataFrame)
+        self.assertGreater(len(idx), 0)
 
     def test_index_components(self):
-        """Test index components (requires stock_index_weight table)."""
-        try:
-            components = self.loader.get_index_components("000300.SH")
-            self.assertIsInstance(components, list)
-            self.assertGreater(len(components), 100)
-        except Exception as e:
-            self.skipTest(f"stock_index_weight table not available: {e}")
+        """Test index components."""
+        components = self.loader.get_index_components("000300.SH")
+        self.assertIsInstance(components, list)
+        self.assertGreater(len(components), 100)
 
 
 @unittest.skipUnless(_db_available(), "Database not available")
@@ -272,13 +266,10 @@ class TestQlibIntegration(unittest.TestCase):
         self.assertGreater(len(inst_list), 100)
 
     def test_instruments_csi300(self):
-        """Test CSI300 instruments (requires stock_index_weight table in PG)."""
-        try:
-            inst = self.D.instruments("csi300")
-            inst_list = self.D.list_instruments(inst, start_time="2024-01-02", end_time="2024-01-10", as_list=True)
-            self.assertGreater(len(inst_list), 100)
-        except Exception as e:
-            self.skipTest(f"stock_index_weight table not available: {e}")
+        """Test CSI300 instruments (queries stock_index_weight from ClickHouse)."""
+        inst = self.D.instruments("csi300")
+        inst_list = self.D.list_instruments(inst, start_time="2024-01-02", end_time="2024-01-10", as_list=True)
+        self.assertGreater(len(inst_list), 100)
 
     def test_features_basic(self):
         df = self.D.features(

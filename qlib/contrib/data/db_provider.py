@@ -258,23 +258,26 @@ class DBInstrumentProvider(InstrumentProvider):
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        if market == "all":
+        # Index code mapping: market name -> ClickHouse index_code
+        _INDEX_MAP = {
+            "csi300": "000300.SH",
+            "csi500": "000905.SH",
+            "sse50": "000016.SH",
+        }
+
+        if market in _INDEX_MAP:
+            # Query component stocks from ClickHouse, then filter PG
+            index_code = _INDEX_MAP[market]
+            ch_sql = f"SELECT DISTINCT con_code AS ts_code FROM stock_index_weight WHERE index_code = '{index_code}'"
+            df_components = _ch_query(ch_sql)
+            if df_components.empty:
+                self._cache[cache_key] = {}
+                return {}
+            codes = df_components["ts_code"].tolist()
+            codes_str = ", ".join(f"'{c}'" for c in codes)
+            where = f"ts_code IN ({codes_str}) AND list_status = 'L'"
+        elif market == "all":
             where = "list_status = 'L'"
-        elif market == "csi300":
-            where = (
-                "ts_code IN (SELECT DISTINCT con_code FROM stock_index_weight "
-                "WHERE index_code = '000300.SH') AND list_status = 'L'"
-            )
-        elif market == "csi500":
-            where = (
-                "ts_code IN (SELECT DISTINCT con_code FROM stock_index_weight "
-                "WHERE index_code = '000905.SH') AND list_status = 'L'"
-            )
-        elif market == "sse50":
-            where = (
-                "ts_code IN (SELECT DISTINCT con_code FROM stock_index_weight "
-                "WHERE index_code = '000016.SH') AND list_status = 'L'"
-            )
         elif market == "sse":
             where = "exchange = 'SSE' AND list_status = 'L'"
         elif market == "szse":
