@@ -37,8 +37,7 @@ from qlib.contrib.data.handler import Alpha158
 # Factor groups
 # ---------------------------------------------------------------------------
 
-ALL_GROUPS = ("valuation", "liquidity", "moneyflow")
-
+ALL_GROUPS = ("valuation", "liquidity", "moneyflow", "finance")
 
 def _valuation_factors() -> Tuple[List[str], List[str]]:
     """估值因子族：5 个静态 + 2 个动态 = 7 个."""
@@ -104,10 +103,69 @@ def _moneyflow_factors() -> Tuple[List[str], List[str]]:
     return fields, names
 
 
+def _finance_factors() -> Tuple[List[str], List[str]]:
+    """财务因子族：5 个 level + 2 个 1 年同比变化 = 7 个.
+
+    底层字段由 DBFeatureProvider 通过 ``stock_income`` + ``stock_balancesheet``
+    联表 + 季度年化 + ann_date 公告日 PIT 滚动 提供（参见 db_provider.py
+    的 ``FINA_DERIVED_FIELDS`` 和 ``_load_fina_per_instrument``）.
+
+    动态因子用 ~250 个交易日的 Ref 近似一年同比，避免依赖更复杂的财报历史索引.
+    """
+    fields = [
+        # ---- 财务水平 ----
+        "$roe",                                  # 净资产收益率（年化）
+        "$npm",                                  # 净利率（cumulative income / cumulative revenue）
+        "$debt_to_assets",                       # 资产负债率
+        "$assets_turn",                          # 总资产周转率（年化）
+        "$log_total_assets",                     # log(总资产) - 规模因子
+        # ---- 财务动态 ----
+        "$roe - Ref($roe, 250)",                 # ROE 1 年同比变化（约 250 个交易日）
+        "$npm - Ref($npm, 250)",                 # 净利率 1 年同比变化
+    ]
+    names = [
+        "ROE",
+        "NPM",
+        "DEBT_TO_ASSETS",
+        "ASSETS_TURN",
+        "LOG_TOTAL_ASSETS",
+        "ROE_DELTA_1Y",
+        "NPM_DELTA_1Y",
+    ]
+    return fields, names
+
+
+def _finance_lite_factors() -> Tuple[List[str], List[str]]:
+    """精简财务因子族（5 个）：去掉与 v1 高度共线的 LOG_TOTAL_ASSETS 和 DEBT_TO_ASSETS.
+
+    在 csi300 横截面上，``LOG_TOTAL_ASSETS`` 与 BP/EP_TTM/LOG_CIRC_MV 的相关
+    都 > 0.5（运行 run_corr_analysis.py 可复现），``DEBT_TO_ASSETS`` 与 BP 也
+    >0.5；本族保留的 5 个因子与 v1 的所有跨族 |corr| 都 < 0.4，是真正独立的
+    财务信号.
+    """
+    fields = [
+        "$roe",
+        "$npm",
+        "$assets_turn",
+        "$roe - Ref($roe, 250)",
+        "$npm - Ref($npm, 250)",
+    ]
+    names = [
+        "ROE",
+        "NPM",
+        "ASSETS_TURN",
+        "ROE_DELTA_1Y",
+        "NPM_DELTA_1Y",
+    ]
+    return fields, names
+
+
 _GROUP_BUILDERS = {
     "valuation": _valuation_factors,
     "liquidity": _liquidity_factors,
     "moneyflow": _moneyflow_factors,
+    "finance":   _finance_factors,
+    "finance_lite": _finance_lite_factors,
 }
 
 
