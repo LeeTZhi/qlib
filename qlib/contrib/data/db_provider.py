@@ -86,6 +86,11 @@ def qlib_to_ts_code(inst: str) -> str:
 _pg_engine = None
 _ch_local = threading.local()
 
+# (qlib_instrument_id, field_lower) -> pd.Series indexed by full-calendar integer
+# position.  Populated by ``DBFeatureProvider.prewarm`` and read by
+# ``DBFeatureProvider.feature`` to short-circuit per-instrument SQL fetches.
+_FEATURE_CACHE: dict = {}
+
 
 def _get_pg_engine():
     """Lazily create a SQLAlchemy engine for PostgreSQL (thread-safe via connection pool)."""
@@ -107,9 +112,15 @@ def _get_pg_engine():
 
 
 def _get_ch_client():
-    """Return a thread-local ClickHouse client (one per thread to avoid concurrency issues)."""
+    """Return a process- and thread-local ClickHouse client.
+
+    Bound to the current pid so that joblib / multiprocessing workers
+    inheriting the parent client (with a now-broken socket) recreate
+    a fresh connection on first use.
+    """
+    pid = os.getpid()
     client = getattr(_ch_local, "client", None)
-    if client is not None:
+    if client is not None and getattr(_ch_local, "pid", None) == pid:
         return client
     try:
         from clickhouse_connect import get_client
@@ -128,6 +139,7 @@ def _get_ch_client():
         host=host, port=port, database=database, username=username, password=password
     )
     _ch_local.client = client
+    _ch_local.pid = pid
     return client
 
 
@@ -163,9 +175,29 @@ PRICE_FIELDS = {
 }
 
 # Fields stored in stock_adj_factor
+# Fields stored in stock_adj_factor.  qlib's Exchange backtest looks up
+# ``$factor`` for the adjustment ratio; we alias it to the same column so
+# backtest's per-(instrument, day) factor lookup hits a real value instead
+# of returning NaN (which would trigger thousands of DEBUG round-trips).
 ADJ_FIELDS = {
     "adj_factor": "adj_factor",
+    "factor":     "adj_factor",
 }
+
+# Price fields that should be backward-adjusted by stock_adj_factor when QLIB_DB_ADJUST_PRICES=1.
+# Using post-adjusted price (close * adj_factor) makes Ref($close,-1)/$close a clean return that
+# does not contain spurious jumps on dividend / split days.  volume / amount / change / pct_chg
+# are kept as-is so they continue to match Tushare's raw values.
+_ADJUSTED_PRICE_COLS = {"open", "high", "low", "close", "pre_close", "vwap"}
+
+
+def _adjust_prices_enabled() -> bool:
+    """Whether the DB providers should return backward-adjusted prices.
+
+    Defaults to True (the historically correct behaviour for factor research).
+    Set ``QLIB_DB_ADJUST_PRICES=0`` to fall back to raw, unadjusted Tushare prices.
+    """
+    return os.environ.get("QLIB_DB_ADJUST_PRICES", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 # Fields stored in stock_daily_basic
 BASIC_FIELDS = {
@@ -186,6 +218,23 @@ BASIC_FIELDS = {
     "circ_mv": "circ_mv",
 }
 
+# Fields stored in stock_moneyflow (主力资金流向, since 2020-01-02)
+# Decimal(18,4) amounts are cast to Float64 in SELECT to round-trip cleanly to numpy.
+MONEYFLOW_FIELDS = {
+    "buy_sm_amount":  "buy_sm_amount",
+    "sell_sm_amount": "sell_sm_amount",
+    "buy_md_amount":  "buy_md_amount",
+    "sell_md_amount": "sell_md_amount",
+    "buy_lg_amount":  "buy_lg_amount",
+    "sell_lg_amount": "sell_lg_amount",
+    "buy_elg_amount": "buy_elg_amount",
+    "sell_elg_amount": "sell_elg_amount",
+    "net_mf_amount":  "net_mf_amount",
+}
+
+# Columns whose source type is Decimal/Int and need toFloat64 cast in SQL.
+_FLOAT_CAST_COLS = set(MONEYFLOW_FIELDS.keys())
+
 # All known fields -> (table, column)
 ALL_FIELDS: dict[str, tuple[str, str]] = {}
 for _col, _ch_col in PRICE_FIELDS.items():
@@ -195,6 +244,8 @@ for _col, _ch_col in ADJ_FIELDS.items():
     ALL_FIELDS[_col] = ("stock_adj_factor", _ch_col)
 for _col, _ch_col in BASIC_FIELDS.items():
     ALL_FIELDS[_col] = ("stock_daily_basic", _ch_col)
+for _col, _ch_col in MONEYFLOW_FIELDS.items():
+    ALL_FIELDS[_col] = ("stock_moneyflow", _ch_col)
 
 # Factor fields (stored in factor_values) - all Float32 columns
 FACTOR_TABLE = "factor_values"
@@ -217,6 +268,45 @@ def _resolve_field(field: str):
     # Check factor_values table columns
     # These are stored as-is (lowercase)
     return None
+
+
+# Regex for extracting $xxx leaf identifiers from qlib expression strings.
+# Matches $word_chars (lowercase or uppercase, plus underscore/digits).
+import re as _re
+_FIELD_RE = _re.compile(r"\$([A-Za-z_][\w]*)")
+
+
+def _extract_raw_fields(expressions) -> list[str]:
+    """Return the unique set of raw leaf field names used by the given qlib
+    expression strings (or Expression objects coerced via ``str``)."""
+    fields: set[str] = set()
+    for expr in expressions:
+        for m in _FIELD_RE.findall(str(expr)):
+            fields.add(m.lower())
+    return sorted(fields)
+
+
+def _is_index_code(ts_code: str) -> bool:
+    """Heuristic check whether ``ts_code`` is an index (vs a regular stock).
+
+    Recognises the common A-share index naming convention:
+      - SH ``000xxx`` (000300, 000905, 000016, 000001, ...)
+      - SZ ``399xxx`` (399300, 399905, 399001, ...)
+    Stocks live under SH 6xxxxx / 9xxxxx and SZ 0xxxxx / 3xxxxx so there is
+    no overlap.
+    """
+    if not isinstance(ts_code, str) or "." not in ts_code:
+        return False
+    code, _, exch = ts_code.partition(".")
+    if exch == "SH":
+        return code.startswith("000")
+    if exch == "SZ":
+        return code.startswith("399")
+    return False
+
+
+# Columns of stock_index_daily that we expose as qlib fields.
+_INDEX_PRICE_COLS = {"open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"}
 
 
 # ---------------------------------------------------------------------------
@@ -247,35 +337,110 @@ class DBCalendarProvider(CalendarProvider):
 class DBInstrumentProvider(InstrumentProvider):
     """
     List instruments from PostgreSQL ``dim_stock_basic`` and ClickHouse
-    ``stock_daily_prices`` to build the (instrument -> time_spans) map.
+    ``stock_index_weight`` to build the (instrument -> time_spans) map.
+
+    Index members are reconstructed point-in-time from ``stock_index_weight``:
+    each rebalance row defines membership from that ``trade_date`` until the
+    next rebalance for the same index, capped by listing / delisting dates.
+    This avoids the survivorship-style leakage where a stock's whole listing
+    span is treated as ``in-index`` just because it appeared on any single
+    rebalance.
     """
 
     # Cache for the instrument dict
     _cache = {}
+
+    # Index code mapping: market name -> ClickHouse index_code
+    _INDEX_MAP = {
+        "csi300": "000300.SH",
+        "csi500": "000905.SH",
+        "sse50":  "000016.SH",
+        "csi100": "000903.SH",
+        "csi800": "000906.SH",
+    }
+
+    def _build_pit_index_membership(self, index_code: str) -> dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]]:
+        """Reconstruct point-in-time index membership from ``stock_index_weight``.
+
+        Returns a dict of ``ts_code -> [(start, end), ...]`` where each interval
+        is a contiguous span during which the stock was a constituent of the
+        given index.  Each row in ``stock_index_weight`` is treated as a
+        rebalance: the constituent set rolls forward until the next rebalance
+        date for the same index (or until today for the latest rebalance).
+        """
+        sql = f"""
+            SELECT trade_date, con_code
+            FROM stock_index_weight
+            WHERE index_code = '{index_code}'
+            ORDER BY trade_date, con_code
+        """
+        df = _ch_query(sql)
+        if df.empty:
+            return {}
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        rebalances = sorted(df["trade_date"].unique())
+        today = pd.Timestamp.now().normalize()
+
+        # Validity window for each rebalance: [trade_date, next_rebalance - 1] (last one rolls to today)
+        rebalance_window = {}
+        for i, d in enumerate(rebalances):
+            if i + 1 < len(rebalances):
+                end = rebalances[i + 1] - pd.Timedelta(days=1)
+            else:
+                end = today
+            rebalance_window[d] = (pd.Timestamp(d), pd.Timestamp(end))
+
+        # ts_code -> raw list of intervals, one per rebalance where it was a constituent
+        raw: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
+        for d, group in df.groupby("trade_date"):
+            s, e = rebalance_window[d]
+            for code in group["con_code"]:
+                raw.setdefault(code, []).append((s, e))
+
+        # Merge consecutive / overlapping intervals so the final list is minimal.
+        merged: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
+        for ts_code, intervals in raw.items():
+            intervals.sort()
+            out: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+            for s, e in intervals:
+                if out and s <= out[-1][1] + pd.Timedelta(days=1):
+                    out[-1] = (out[-1][0], max(out[-1][1], e))
+                else:
+                    out.append((s, e))
+            merged[ts_code] = out
+        return merged
+
+    @staticmethod
+    def _intersect_intervals(
+        a: list[tuple[pd.Timestamp, pd.Timestamp]],
+        b_start: pd.Timestamp,
+        b_end: pd.Timestamp,
+    ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+        """Intersect a list of intervals with a single ``[b_start, b_end]`` window."""
+        out = []
+        for s, e in a:
+            ns = max(s, b_start)
+            ne = min(e, b_end)
+            if ns <= ne:
+                out.append((ns, ne))
+        return out
 
     def _load_instruments(self, market: str, freq: str = "day"):
         cache_key = f"{market}_{freq}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        # Index code mapping: market name -> ClickHouse index_code
-        _INDEX_MAP = {
-            "csi300": "000300.SH",
-            "csi500": "000905.SH",
-            "sse50": "000016.SH",
-        }
+        membership: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] | None = None
 
-        if market in _INDEX_MAP:
-            # Query component stocks from ClickHouse, then filter PG
-            index_code = _INDEX_MAP[market]
-            ch_sql = f"SELECT DISTINCT con_code AS ts_code FROM stock_index_weight WHERE index_code = '{index_code}'"
-            df_components = _ch_query(ch_sql)
-            if df_components.empty:
+        if market in self._INDEX_MAP:
+            index_code = self._INDEX_MAP[market]
+            membership = self._build_pit_index_membership(index_code)
+            if not membership:
                 self._cache[cache_key] = {}
                 return {}
-            codes = df_components["ts_code"].tolist()
-            codes_str = ", ".join(f"'{c}'" for c in codes)
-            where = f"ts_code IN ({codes_str}) AND list_status = 'L'"
+            codes_str = ", ".join(f"'{c}'" for c in membership.keys())
+            where = f"ts_code IN ({codes_str})"
         elif market == "all":
             where = "list_status = 'L'"
         elif market == "sse":
@@ -285,26 +450,34 @@ class DBInstrumentProvider(InstrumentProvider):
         else:
             where = "list_status = 'L'"
 
-        # Get listing dates from PG
-        pg_sql = f"SELECT ts_code, list_date, COALESCE(delist_date, '2099-12-31') AS delist_date FROM dim_stock_basic WHERE {where}"
+        # Get listing / delisting dates from PG.  Note: index-membership branch
+        # intentionally does NOT filter by ``list_status = 'L'`` so that stocks
+        # already delisted are still recovered with their proper delist_date.
+        pg_sql = (
+            "SELECT ts_code, list_date, COALESCE(delist_date, '2099-12-31') AS delist_date "
+            f"FROM dim_stock_basic WHERE {where}"
+        )
         df_meta = _pg_query(pg_sql)
-
-        # Get actual trading range from CH to narrow down
-        ts_codes = df_meta["ts_code"].tolist()
-        if not ts_codes:
+        if df_meta.empty:
             self._cache[cache_key] = {}
             return {}
 
-        # Build instrument dict: qlib_id -> [(start, end), ...]
-        instruments = {}
+        today = pd.Timestamp.now().normalize()
+        instruments: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
         for _, row in df_meta.iterrows():
-            qlib_id = ts_code_to_qlib(row["ts_code"])
-            start = pd.Timestamp(row["list_date"])
-            end = pd.Timestamp(row["delist_date"])
-            # Cap end date to today
-            if end > pd.Timestamp.now():
-                end = pd.Timestamp.now()
-            instruments[qlib_id] = [(start, end)]
+            ts_code = row["ts_code"]
+            listing = pd.Timestamp(row["list_date"])
+            delist = pd.Timestamp(row["delist_date"])
+            if delist > today:
+                delist = today
+
+            if membership is not None:
+                intervals = self._intersect_intervals(membership.get(ts_code, []), listing, delist)
+                if not intervals:
+                    continue
+                instruments[ts_code_to_qlib(ts_code)] = intervals
+            else:
+                instruments[ts_code_to_qlib(ts_code)] = [(listing, delist)]
 
         self._cache[cache_key] = instruments
         return instruments
@@ -370,37 +543,262 @@ class DBFeatureProvider(FeatureProvider):
         cls._factor_columns = [c for c in cols if c not in ("ts_code", "trade_date", "updated_at")]
         return cls._factor_columns
 
+    # ------------------------------------------------------------------
+    # Index data path
+    # ------------------------------------------------------------------
+
+    def _index_feature(self, ts_code: str, field_lower: str, start_index, end_index, freq: str):
+        """Return index field values from stock_index_daily.
+
+        Used for benchmark instruments (SH000300, SH000905, ...).  Indices
+        do not have splits/dividends so ``$factor`` always returns 1.0.
+        """
+        from qlib.data.data import Cal
+
+        calendar = Cal.calendar(freq=freq)
+        if len(calendar) == 0:
+            return pd.Series(dtype=np.float32)
+
+        if isinstance(start_index, (int, np.integer)):
+            start_idx = int(max(0, start_index))
+            end_idx = int(min(end_index, len(calendar) - 1))
+            start_date = calendar[start_idx]
+            end_date = calendar[end_idx]
+        else:
+            start_date = pd.Timestamp(start_index)
+            end_date = pd.Timestamp(end_index)
+            start_idx = int(np.searchsorted(calendar, start_date))
+            end_idx = int(np.searchsorted(calendar, end_date))
+
+        # Synthetic / static fields
+        if field_lower == "factor":  # adjustment factor: indices don't split, return 1.0
+            n = end_idx - start_idx + 1
+            if n <= 0:
+                return pd.Series(dtype=np.float32)
+            return pd.Series(
+                np.ones(n, dtype=np.float32),
+                index=np.arange(start_idx, start_idx + n),
+                dtype=np.float32,
+            )
+
+        # Map qlib field -> stock_index_daily column.
+        col = field_lower
+        if col == "volume":
+            col = "vol"
+        if col == "vwap":
+            # Indices don't have a meaningful VWAP; fall back to close so that
+            # downstream expressions don't blow up.
+            col = "close"
+        if col not in _INDEX_PRICE_COLS:
+            return pd.Series(dtype=np.float32)
+
+        sql = f"""
+            SELECT trade_date, toFloat64({col}) AS {col}
+            FROM stock_index_daily
+            WHERE ts_code = %(ts_code)s
+              AND trade_date >= %(start)s
+              AND trade_date <= %(end)s
+            ORDER BY trade_date
+        """
+        params = {
+            "ts_code": ts_code,
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d"),
+        }
+        df = _ch_query(sql, params=params)
+        if df.empty:
+            return pd.Series(
+                np.nan, index=np.arange(start_idx, end_idx + 1), dtype=np.float32
+            )
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        df = df.drop_duplicates(subset="trade_date", keep="last").set_index("trade_date")
+        s = df[col].astype(np.float32)
+
+        cal_sub = calendar[start_idx : end_idx + 1]
+        s = s.reindex(cal_sub)
+        s.index = np.arange(start_idx, start_idx + len(s))
+        return s
+
+    # ------------------------------------------------------------------
+    # Bulk pre-warm
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def clear_cache():
+        """Drop the bulk feature cache (call between datasets if memory is tight)."""
+        _FEATURE_CACHE.clear()
+
+    @classmethod
+    def prewarm(
+        cls,
+        instruments: list,
+        fields: list,
+        start_time,
+        end_time,
+        freq: str = "day",
+        lookback_days: int = 365,
+    ):
+        """Bulk-load (instrument, raw_field) Series and store them in
+        ``_FEATURE_CACHE`` so subsequent ``feature()`` calls skip the per-query
+        round trip to ClickHouse.
+
+        ``fields`` is the list of *raw* field names (without ``$``) that the
+        downstream qlib expressions reference.  The pre-warmed range is
+        extended by ``lookback_days`` to cover qlib's expression-window
+        lookback (Mean, Std, Ref(-2), …).
+        """
+        if freq != "day":
+            return  # bulk loader is daily-only
+        instruments = [str(i) for i in instruments if i]
+        clean_fields = []
+        for f in fields:
+            f = str(f)
+            if f.startswith("$"):
+                f = f[1:]
+            clean_fields.append(f.lower())
+        clean_fields = sorted(set(clean_fields))
+        if not instruments or not clean_fields:
+            return
+
+        # Skip raw fields that are not table-resolvable (e.g. derived expressions
+        # that survived the regex extraction by accident).
+        clean_fields = [
+            f for f in clean_fields
+            if _resolve_field(f) is not None or f == "vwap"
+        ]
+        if not clean_fields:
+            return
+
+        from qlib.data.data import Cal
+        cal = Cal.calendar(freq=freq)
+        if len(cal) == 0:
+            return
+        cal_index = pd.DatetimeIndex(cal)
+
+        start_dt = pd.Timestamp(start_time) - pd.Timedelta(days=lookback_days)
+        end_dt = pd.Timestamp(end_time)
+
+        loader = DBDataLoader()
+        df = loader.load_features(
+            instruments,
+            clean_fields,
+            start_dt.strftime("%Y-%m-%d"),
+            end_dt.strftime("%Y-%m-%d"),
+            freq="day",
+        )
+        if df.empty:
+            return
+
+        # df.index is (datetime, instrument); columns = clean_fields.
+        # Build a datetime -> integer position mapping using qlib's full calendar.
+        cal_to_pos = pd.Series(np.arange(len(cal_index)), index=cal_index)
+
+        for inst, sub in df.groupby(level="instrument"):
+            sub = sub.droplevel("instrument").sort_index()
+            # Map datetime index to integer position in qlib calendar; drop dates
+            # that are not on the calendar (shouldn't normally happen).
+            int_pos = cal_to_pos.reindex(sub.index)
+            mask = int_pos.notna()
+            sub = sub[mask.values]
+            int_pos = int_pos[mask].astype(int)
+            for f in clean_fields:
+                if f not in sub.columns:
+                    continue
+                vals = sub[f].astype(np.float32).values
+                if len(vals) == 0:
+                    continue
+                s = pd.Series(vals, index=int_pos.values, dtype=np.float32)
+                # Defensive: keep last duplicate if any
+                s = s[~s.index.duplicated(keep="last")]
+                _FEATURE_CACHE[(str(inst), f)] = s
+
+    # ------------------------------------------------------------------
+
     def feature(self, instrument, field, start_index, end_index, freq):
         field_str = str(field)
         if field_str.startswith("$"):
             field_str = field_str[1:]
         field_lower = field_str.lower()
 
+        # Bulk cache fast path
+        cache_key = (str(instrument), field_lower)
+        if cache_key in _FEATURE_CACHE:
+            full = _FEATURE_CACHE[cache_key]
+            if isinstance(start_index, (int, np.integer)) and isinstance(end_index, (int, np.integer)):
+                si = int(start_index)
+                ei = int(end_index)
+                if ei >= si:
+                    mask = (full.index >= si) & (full.index <= ei)
+                    return full[mask]
+            # Fall through to slow path on weird types
+
         ts_code = qlib_to_ts_code(instrument)
 
+        # ---- Index instruments are stored in stock_index_daily, not stock_daily_prices ----
+        # Catch the SH 000xxx / SZ 399xxx pattern (CSI300, CSI500, SSE50, etc.) that the
+        # backtest engine queries for benchmark / universe membership.
+        if _is_index_code(ts_code):
+            return self._index_feature(
+                ts_code, field_lower, start_index, end_index, freq,
+            )
+
         # Resolve which table + column to query
+        adjust = _adjust_prices_enabled()
         mapping = _resolve_field(field_str)
         if mapping is not None:
             table, col = mapping
-            sql_template = f"""
-                SELECT trade_date, {{col}}
-                FROM {{table}}
-                WHERE ts_code = %(ts_code)s
-                  AND trade_date >= %(start)s
-                  AND trade_date <= %(end)s
-                ORDER BY trade_date
-            """
-            sql = sql_template.format(col=col, table=table)
+            if adjust and table == "stock_daily_prices" and field_lower in _ADJUSTED_PRICE_COLS:
+                # Backward-adjusted price = raw * adj_factor (Tushare convention).
+                # COALESCE keeps the raw price if adj_factor is missing for the row.
+                sql = f"""
+                    SELECT p.trade_date, p.{col} * COALESCE(a.adj_factor, 1.0) AS {col}
+                    FROM stock_daily_prices AS p
+                    LEFT JOIN stock_adj_factor AS a
+                      ON p.ts_code = a.ts_code AND p.trade_date = a.trade_date
+                    WHERE p.ts_code = %(ts_code)s
+                      AND p.trade_date >= %(start)s
+                      AND p.trade_date <= %(end)s
+                    ORDER BY p.trade_date
+                """
+            else:
+                # Cast Decimal/Int columns (e.g. moneyflow amounts) to Float64 so the
+                # value round-trips cleanly to numpy.float instead of Python Decimal.
+                col_expr = f"toFloat64({col}) AS {col}" if col in _FLOAT_CAST_COLS else col
+                sql_template = f"""
+                    SELECT trade_date, {{col_expr}}
+                    FROM {{table}}
+                    WHERE ts_code = %(ts_code)s
+                      AND trade_date >= %(start)s
+                      AND trade_date <= %(end)s
+                    ORDER BY trade_date
+                """
+                sql = sql_template.format(col_expr=col_expr, table=table)
         elif field_lower == "vwap":
-            sql = """
-                SELECT trade_date,
-                       CASE WHEN vol > 0 THEN amount / (vol * 100) * 1000 ELSE NaN END AS vwap
-                FROM stock_daily_prices
-                WHERE ts_code = %(ts_code)s
-                  AND trade_date >= %(start)s
-                  AND trade_date <= %(end)s
-                ORDER BY trade_date
-            """
+            if adjust:
+                sql = """
+                    SELECT p.trade_date,
+                           CASE WHEN p.vol > 0
+                                THEN toFloat64(p.amount) / (toFloat64(p.vol) * 100) * 1000 * COALESCE(a.adj_factor, 1.0)
+                                ELSE NaN END AS vwap
+                    FROM stock_daily_prices AS p
+                    LEFT JOIN stock_adj_factor AS a
+                      ON p.ts_code = a.ts_code AND p.trade_date = a.trade_date
+                    WHERE p.ts_code = %(ts_code)s
+                      AND p.trade_date >= %(start)s
+                      AND p.trade_date <= %(end)s
+                    ORDER BY p.trade_date
+                """
+            else:
+                sql = """
+                    SELECT trade_date,
+                           CASE WHEN vol > 0 THEN toFloat64(amount) / (toFloat64(vol) * 100) * 1000 ELSE NaN END AS vwap
+                    FROM stock_daily_prices
+                    WHERE ts_code = %(ts_code)s
+                      AND trade_date >= %(start)s
+                      AND trade_date <= %(end)s
+                    ORDER BY trade_date
+                """
             col = "vwap"
         else:
             # Try factor_values table
@@ -452,6 +850,8 @@ class DBFeatureProvider(FeatureProvider):
             )
 
         df["trade_date"] = pd.to_datetime(df["trade_date"])
+        # Remove duplicate dates (keep last) to avoid reindex errors
+        df = df.drop_duplicates(subset="trade_date", keep="last")
         df = df.set_index("trade_date")
         s = df[col].astype(np.float32)
 
@@ -535,8 +935,14 @@ class DBDatasetProvider(DatasetProvider):
         start_time=None,
         end_time=None,
         freq="day",
+        disk_cache=0,
         inst_processors=[],
     ):
+        # ``disk_cache`` is kept for signature parity with qlib's 6-positional
+        # call (qlib.data.data:BaseProvider.features falls back to 5-positional
+        # only when this raises TypeError).  We don't implement caching here
+        # because the underlying ClickHouse queries are already cheap.
+        del disk_cache  # noqa: F841 — silently ignored
         from qlib.data.data import Cal
 
         instruments_d = self.get_instruments_d(instruments, freq)
@@ -551,6 +957,29 @@ class DBDatasetProvider(DatasetProvider):
                 )
             start_time = cal[0]
             end_time = cal[-1]
+
+        # Bulk pre-warm: extract raw $xxx leaf names from the expression strings,
+        # bulk-fetch them via DBDataLoader, and stash in _FEATURE_CACHE.  This
+        # turns expression evaluation into in-memory operations and avoids
+        # per-(instrument, field) ClickHouse round-trips (~100x speedup).
+        try:
+            raw_fields = _extract_raw_fields(column_names)
+            if raw_fields:
+                # ``instruments_d`` is sometimes a ``dict[str, intervals]`` and sometimes a
+                # plain ``list[str]`` depending on the caller (DataHandler vs backtest).
+                if isinstance(instruments_d, dict):
+                    inst_keys = list(instruments_d.keys())
+                else:
+                    inst_keys = list(instruments_d)
+                DBFeatureProvider.prewarm(
+                    inst_keys,
+                    raw_fields,
+                    start_time,
+                    end_time,
+                    freq=freq,
+                )
+        except Exception as exc:  # pragma: no cover -- prewarm is best-effort
+            logger.warning("DBDatasetProvider.prewarm skipped: %s", exc)
 
         data = self.dataset_processor(
             instruments_d, column_names, start_time, end_time, freq, inst_processors=inst_processors
@@ -905,6 +1334,7 @@ class DBDataLoader:
                 table_fields.setdefault("factor_values", []).append((f, f.lower()))
 
         all_dfs = []
+        adjust = _adjust_prices_enabled()
 
         for table, field_pairs in table_fields.items():
             ch_cols = [pair[1] for pair in field_pairs]
@@ -923,23 +1353,61 @@ class DBDataLoader:
                 ch_cols = [pair[1] for pair in field_pairs]
                 qlib_names = [pair[0] for pair in field_pairs]
 
-            select_exprs = ["ts_code", "trade_date"] + ch_cols
+            # Decide if we need to JOIN stock_adj_factor for backward-adjusted prices.
+            join_adj = (
+                adjust
+                and table == "stock_daily_prices"
+                and any(qn.lower() in _ADJUSTED_PRICE_COLS for qn in qlib_names)
+            )
 
-            if table == "stock_daily_prices" and "vwap" in qlib_names:
-                idx = qlib_names.index("vwap")
-                select_exprs[idx + 2] = (
-                    "CASE WHEN vol > 0 THEN amount / (vol * 100) * 1000 ELSE NaN END AS vwap"
-                )
+            if join_adj:
+                select_exprs = ["p.ts_code AS ts_code", "p.trade_date AS trade_date"]
+                for qname, col in zip(qlib_names, ch_cols):
+                    if qname.lower() == "vwap":
+                        select_exprs.append(
+                            "CASE WHEN p.vol > 0 "
+                            "THEN toFloat64(p.amount) / (toFloat64(p.vol) * 100) * 1000 * COALESCE(a.adj_factor, 1.0) "
+                            "ELSE NaN END AS vwap"
+                        )
+                    elif qname.lower() in _ADJUSTED_PRICE_COLS:
+                        select_exprs.append(f"p.{col} * COALESCE(a.adj_factor, 1.0) AS {col}")
+                    else:
+                        select_exprs.append(f"p.{col} AS {col}")
 
-            select_str = ", ".join(select_exprs)
-            sql = f"""
-                SELECT {select_str}
-                FROM {table}
-                WHERE ts_code IN ({codes_str})
-                  AND trade_date >= '{start_time}'
-                  AND trade_date <= '{end_time}'
-                ORDER BY ts_code, trade_date
-            """
+                select_str = ", ".join(select_exprs)
+                sql = f"""
+                    SELECT {select_str}
+                    FROM stock_daily_prices AS p
+                    LEFT JOIN stock_adj_factor AS a
+                      ON p.ts_code = a.ts_code AND p.trade_date = a.trade_date
+                    WHERE p.ts_code IN ({codes_str})
+                      AND p.trade_date >= '{start_time}'
+                      AND p.trade_date <= '{end_time}'
+                    ORDER BY p.ts_code, p.trade_date
+                """
+            else:
+                # Wrap Decimal/Int columns (e.g. moneyflow amounts) with toFloat64 so the
+                # numpy round-trip stays clean.
+                select_exprs = ["ts_code", "trade_date"] + [
+                    f"toFloat64({c}) AS {c}" if c in _FLOAT_CAST_COLS else c
+                    for c in ch_cols
+                ]
+
+                if table == "stock_daily_prices" and "vwap" in qlib_names:
+                    idx = qlib_names.index("vwap")
+                    select_exprs[idx + 2] = (
+                        "CASE WHEN vol > 0 THEN toFloat64(amount) / (toFloat64(vol) * 100) * 1000 ELSE NaN END AS vwap"
+                    )
+
+                select_str = ", ".join(select_exprs)
+                sql = f"""
+                    SELECT {select_str}
+                    FROM {table}
+                    WHERE ts_code IN ({codes_str})
+                      AND trade_date >= '{start_time}'
+                      AND trade_date <= '{end_time}'
+                    ORDER BY ts_code, trade_date
+                """
             df = _ch_query(sql)
             if df.empty:
                 continue
@@ -948,6 +1416,12 @@ class DBDataLoader:
             df["instrument"] = df["ts_code"].map(id_map)
             df = df.drop(columns=["ts_code"])
             df = df.rename(columns=dict(zip(ch_cols, qlib_names)))
+            # Source ClickHouse tables (stock_daily_prices, stock_adj_factor,
+            # stock_daily_basic) are known to contain duplicate (ts_code,
+            # trade_date) rows; the LEFT JOIN above also amplifies them.
+            # Keep the last occurrence so we end up with one row per
+            # (instrument, datetime) before merging across tables.
+            df = df.drop_duplicates(subset=["instrument", "trade_date"], keep="last")
             all_dfs.append(df)
 
         if not all_dfs:
@@ -1005,6 +1479,13 @@ def init_qlib_with_db(
     # by name ("DBProvider") when qlib.init() calls register_all_wrappers().
     import qlib.data as _data_pkg
     _data_pkg.DBProvider = DBProvider
+
+    # Default kernels=1: qlib's dataset_processor uses joblib to parallelise per-instrument
+    # expression evaluation; with the DB backend that floods ClickHouse with hundreds of
+    # concurrent HTTP queries and produces transient connection errors.  Single-threaded
+    # evaluation is ~2-3x slower per dataset build, but stable.  Override via kernels=...
+    # if your ClickHouse is sized for it.
+    kwargs.setdefault("kernels", 1)
 
     qlib.init(
         provider_uri=provider_uri,
