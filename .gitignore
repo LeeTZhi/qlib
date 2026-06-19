@@ -53,11 +53,7 @@ tags
 .aider*
 
 # Runtime artifacts (per-session work logs, pids, draft summaries)
-.daily_pid
-.poc_pid
-.poc_v2_pid
-.rolling_pid
-.final_pid
+.*_pid
 .review_summary.md
 .benchmark_run/
 try_logs/

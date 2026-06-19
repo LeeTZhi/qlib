@@ -91,6 +91,23 @@ _ch_local = threading.local()
 # ``DBFeatureProvider.feature`` to short-circuit per-instrument SQL fetches.
 _FEATURE_CACHE: dict = {}
 
+# Per-instrument financial-ratio cache.  Each entry is a DataFrame indexed by
+# ``ann_date`` with columns ``roe``, ``npm``, ``debt_to_assets``,
+# ``assets_turn``, ``log_total_assets``.  Populated lazily by
+# ``_load_fina_per_instrument`` and reused across feature() calls.
+_FINA_CACHE: dict = {}
+
+# Derived finance fields that go through the PIT carry-forward path.
+# These names are intentionally kept short and lower-case so the qlib
+# expression parser treats them as ordinary leaf identifiers.
+FINA_DERIVED_FIELDS = {
+    "roe",
+    "npm",
+    "debt_to_assets",
+    "assets_turn",
+    "log_total_assets",
+}
+
 
 def _get_pg_engine():
     """Lazily create a SQLAlchemy engine for PostgreSQL (thread-safe via connection pool)."""
@@ -307,6 +324,67 @@ def _is_index_code(ts_code: str) -> bool:
 
 # Columns of stock_index_daily that we expose as qlib fields.
 _INDEX_PRICE_COLS = {"open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"}
+
+
+# Quarter-end month -> annualization multiplier for cumulative income statements.
+# Tushare's stock_income reports cumulative figures: Q1 = 3m, H1 = 6m, Q3 = 9m, FY = 12m.
+_QUARTER_ANN_FACTOR = {3: 4.0, 6: 2.0, 9: 4.0 / 3.0, 12: 1.0}
+
+
+def _load_fina_per_instrument(ts_code: str) -> pd.DataFrame:
+    """Pull income + balance sheet for one ts_code, dedupe, and compute the
+    derived finance ratios used by ``FINA_DERIVED_FIELDS``.
+
+    Returns a DataFrame indexed by ``ann_date`` (DatetimeIndex) with one
+    column per field in ``FINA_DERIVED_FIELDS``.  Caches per-process so
+    repeated calls during a single backtest only hit ClickHouse once.
+    """
+    if ts_code in _FINA_CACHE:
+        return _FINA_CACHE[ts_code]
+
+    sql = """
+        SELECT
+            i.ann_date AS ann_date,
+            i.end_date AS end_date,
+            any(toFloat64(i.n_income_attr_p)) AS n_income,
+            any(toFloat64(i.revenue))         AS revenue,
+            any(toFloat64(b.total_assets))    AS total_assets,
+            any(toFloat64(b.total_liab))      AS total_liab,
+            any(toFloat64(b.total_hldr_eqy_exc_min_int)) AS equity
+        FROM stock_income i
+        LEFT JOIN stock_balancesheet b
+          ON i.ts_code = b.ts_code AND i.end_date = b.end_date
+        WHERE i.ts_code = %(ts_code)s
+        GROUP BY i.ts_code, i.ann_date, i.end_date
+        ORDER BY i.ann_date
+    """
+    df = _ch_query(sql, params={"ts_code": ts_code})
+    if df.empty:
+        _FINA_CACHE[ts_code] = df
+        return df
+
+    df["ann_date"] = pd.to_datetime(df["ann_date"])
+    df["end_date"] = pd.to_datetime(df["end_date"])
+
+    ann_factor = df["end_date"].dt.month.map(_QUARTER_ANN_FACTOR)
+
+    # Defensive: avoid 0 / negative denominators in derived ratios
+    eq = df["equity"].where(df["equity"] != 0, np.nan)
+    rev = df["revenue"].where(df["revenue"] != 0, np.nan)
+    ta = df["total_assets"].where(df["total_assets"] != 0, np.nan)
+
+    out = pd.DataFrame({"ann_date": df["ann_date"]})
+    out["roe"]              = (df["n_income"] * ann_factor) / eq          # 净资产收益率（年化）
+    out["npm"]              = df["n_income"] / rev                        # 净利率（不年化，分子分母都是累计）
+    out["debt_to_assets"]   = df["total_liab"] / ta                       # 资产负债率
+    out["assets_turn"]      = (df["revenue"] * ann_factor) / ta           # 资产周转率（年化）
+    out["log_total_assets"] = np.log(ta)                                  # 总资产 log（规模）
+
+    out = out.drop_duplicates(subset="ann_date", keep="last").set_index("ann_date").sort_index()
+    out = out.astype(np.float32)
+
+    _FINA_CACHE[ts_code] = out
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +699,45 @@ class DBFeatureProvider(FeatureProvider):
         return s
 
     # ------------------------------------------------------------------
+    # Finance fields (PIT carry-forward)
+    # ------------------------------------------------------------------
+
+    def _fina_feature(self, ts_code: str, field_lower: str, start_index, end_index, freq: str):
+        """Return a derived finance ratio with PIT carry-forward.
+
+        Each ratio is reported on ``ann_date`` (announcement date); we ffill
+        forward into the trading calendar so that at any backtest day T the
+        latest known value as of T is used.
+        """
+        from qlib.data.data import Cal
+
+        calendar = Cal.calendar(freq=freq)
+        if len(calendar) == 0:
+            return pd.Series(dtype=np.float32)
+
+        if isinstance(start_index, (int, np.integer)):
+            start_idx = int(max(0, start_index))
+            end_idx = int(min(end_index, len(calendar) - 1))
+        else:
+            start_dt = pd.Timestamp(start_index)
+            end_dt = pd.Timestamp(end_index)
+            start_idx = int(np.searchsorted(calendar, start_dt))
+            end_idx = int(np.searchsorted(calendar, end_dt))
+
+        df = _load_fina_per_instrument(ts_code)
+        if df.empty or field_lower not in df.columns:
+            return pd.Series(
+                np.nan, index=np.arange(start_idx, end_idx + 1), dtype=np.float32
+            )
+
+        cal_sub = calendar[start_idx : end_idx + 1]
+        s = df[field_lower].astype(np.float32)
+        # PIT carry-forward: at each trading day T use the latest ann_date <= T.
+        s = s.reindex(cal_sub, method="ffill")
+        s.index = np.arange(start_idx, start_idx + len(s))
+        return s
+
+    # ------------------------------------------------------------------
     # Bulk pre-warm
     # ------------------------------------------------------------------
 
@@ -740,6 +857,12 @@ class DBFeatureProvider(FeatureProvider):
         # backtest engine queries for benchmark / universe membership.
         if _is_index_code(ts_code):
             return self._index_feature(
+                ts_code, field_lower, start_index, end_index, freq,
+            )
+
+        # ---- Derived finance ratios (PIT carry-forward) ----
+        if field_lower in FINA_DERIVED_FIELDS:
+            return self._fina_feature(
                 ts_code, field_lower, start_index, end_index, freq,
             )
 
